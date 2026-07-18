@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import quote
@@ -40,6 +41,26 @@ MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", "1048576"))
 MAX_RESPONSE_BYTES = int(os.environ.get("MAX_RESPONSE_BYTES", "5242880"))
 MAX_STRING_LENGTH = int(os.environ.get("MAX_STRING_LENGTH", "250000"))
 REDACTION_CONCURRENCY = int(os.environ.get("REDACTION_CONCURRENCY", "8"))
+
+# Keep ordinary names and email addresses available to the agent, but redact
+# high-risk identifiers and contact/payment data from provider responses.
+SENSITIVE_PII_ENTITIES = tuple(
+    item.strip()
+    for item in os.environ.get(
+        "SENSITIVE_PII_ENTITIES",
+        "CREDIT_CARD,US_SSN,US_BANK_NUMBER,US_DRIVER_LICENSE,US_PASSPORT,"
+        "IBAN_CODE,PHONE_NUMBER,IP_ADDRESS,CRYPTO",
+    ).split(",")
+    if item.strip()
+)
+
+# Defense-in-depth for long bare numeric identifiers that Presidio may not
+# classify because the provider response omits context (for example an ID
+# number returned as a standalone JSON string). Dates and short IDs are left
+# alone to avoid breaking MCP/Gmail identifiers.
+LONG_NUMERIC_IDENTIFIER = re.compile(
+    r"(?<![A-Za-z0-9])(?:\d[ -]?){9,18}\d(?![A-Za-z0-9])"
+)
 
 # Add only headers OpenConnector genuinely requires.
 ALLOWED_REQUEST_HEADERS = {
@@ -135,6 +156,7 @@ async def redact_text(app: FastAPI, value: str) -> str:
                 json={
                     "text": value,
                     "language": "en",
+                    "entities": list(SENSITIVE_PII_ENTITIES),
                 },
             )
 
@@ -149,7 +171,7 @@ async def redact_text(app: FastAPI, value: str) -> str:
         # An empty result is accepted only as Presidio's explicit determination
         # that no configured recognizer detected PII.
         if not results:
-            return value
+            return redact_numeric_identifiers(value)
 
         async with semaphore:
             anonymizer_response = await client.post(
@@ -175,11 +197,11 @@ async def redact_text(app: FastAPI, value: str) -> str:
         if not isinstance(redacted, str):
             raise RedactionFailure("Invalid anonymizer response")
 
-        # If PII was detected but the text was not changed, fail closed.
+        # If sensitive PII was detected but the text was not changed, fail closed.
         if redacted == value:
             raise RedactionFailure("Anonymizer did not alter detected PII")
 
-        return redacted
+        return redact_numeric_identifiers(redacted)
 
     except RedactionFailure:
         raise
@@ -190,6 +212,11 @@ async def redact_text(app: FastAPI, value: str) -> str:
         ValueError,
     ) as exc:
         raise RedactionFailure("Redaction service failure") from exc
+
+
+def redact_numeric_identifiers(value: str) -> str:
+    """Mask long standalone numeric identifiers missed by recognizers."""
+    return LONG_NUMERIC_IDENTIFIER.sub("<REDACTED_NUMERIC_IDENTIFIER>", value)
 
 
 async def redact_json(app: FastAPI, value: Any) -> Any:
@@ -203,8 +230,8 @@ async def redact_json(app: FastAPI, value: Any) -> Any:
         redacted: dict[str, Any] = {}
 
         for key, item in value.items():
-            # JSON keys are strings, but normalize defensively.
-            safe_key = await redact_text(app, str(key))
+            # Preserve JSON/MCP field names; only redact their values.
+            safe_key = str(key)
             safe_value = await redact_json(app, item)
 
             # Prevent collisions when several PII keys become <REDACTED>.
@@ -224,15 +251,55 @@ async def redact_json(app: FastAPI, value: Any) -> Any:
             for item in value
         ]
 
-    # Numbers may be phone numbers, account numbers, SSNs without punctuation,
-    # timestamps, coordinates, or organization-specific identifiers.
-    #
-    # Blocking them is restrictive, but it is safer than claiming that arbitrary
-    # numeric values can always be classified correctly.
+    # Numeric JSON values may be protocol IDs, timestamps, or amounts. Preserve
+    # them because changing MCP envelope numbers can break request correlation;
+    # string-form identifiers are handled by Presidio and the fallback regex.
     if isinstance(value, (int, float)):
-        return "<REDACTED_NUMERIC_VALUE>"
+        # Preserve JSON/MCP protocol numbers. Sensitive identifiers are
+        # detected when represented as strings and handled above.
+        return value
 
     raise RedactionFailure("Unsupported JSON value type")
+
+
+async def redact_mcp_body(app: FastAPI, body: bytes, content_type: str) -> bytes:
+    """Redact MCP JSON or SSE data without changing the MCP framing."""
+    media_type = content_type.split(";", 1)[0].strip().lower()
+
+    if media_type in {"application/json", "application/problem+json"}:
+        try:
+            decoded = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RedactionFailure("Invalid MCP JSON response") from exc
+        redacted = await redact_json(app, decoded)
+        return json.dumps(redacted, ensure_ascii=False, separators=(",", ":")).encode()
+
+    if media_type == "text/event-stream":
+        text = body.decode("utf-8")
+        output: list[str] = []
+        for line in text.splitlines(keepends=True):
+            if not line.startswith("data:"):
+                output.append(line)
+                continue
+
+            prefix, raw = line.split(":", 1)
+            payload = raw[1:] if raw.startswith(" ") else raw
+            newline = "\n" if line.endswith("\n") else ""
+            try:
+                decoded = json.loads(payload.rstrip("\r\n"))
+                safe_payload = json.dumps(
+                    await redact_json(app, decoded),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            except json.JSONDecodeError:
+                safe_payload = redact_numeric_identifiers(payload.rstrip("\r\n"))
+            output.append(f"{prefix}: {safe_payload}{newline}")
+        return "".join(output).encode("utf-8")
+
+    # MCP implementations sometimes omit a precise content type. Fail closed
+    # rather than return an unscanned provider response.
+    raise RedactionFailure("Unsupported MCP response content type")
 
 
 def filtered_request_headers(request: Request) -> dict[str, str]:
@@ -307,12 +374,20 @@ async def proxy_mcp_stream(request: Request):
     if not 200 <= upstream.status_code < 300:
         return safe_error(502, "upstream_rejected")
 
-    # Stream the raw upstream body back to the client.
+    content_type = upstream.headers.get("content-type", "application/json")
+    if len(upstream.content) > MAX_RESPONSE_BYTES:
+        return safe_error(502, "upstream_response_too_large")
+    try:
+        redacted_body = await redact_mcp_body(request.app, upstream.content, content_type)
+    except RedactionFailure:
+        logger.exception("MCP response blocked because redaction failed")
+        return safe_error(502, "redaction_failed")
+
     return StreamingResponse(
-        upstream.aiter_bytes(),
+        iter([redacted_body]),
         status_code=upstream.status_code,
         headers={
-            "content-type": upstream.headers.get("content-type", "application/json"),
+            "content-type": content_type,
             "cache-control": "no-store",
             "x-content-type-options": "nosniff",
         },
