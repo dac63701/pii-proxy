@@ -18,6 +18,14 @@ OC_URL = os.environ.get(
     "http://openconnector:3000",
 ).rstrip("/")
 
+# Separate credentials for the two trust boundaries. Never forward the
+# caller's proxy bearer token to OpenConnector.
+PII_PROXY_AUTH_TOKEN = os.environ.get("PII_PROXY_AUTH_TOKEN", "").strip()
+OPENCONNECTOR_RUNTIME_TOKEN = os.environ.get(
+    "OPENCONNECTOR_RUNTIME_TOKEN",
+    "",
+).strip()
+
 ANALYZER_URL = os.environ.get(
     "PRESIDIO_ANALYZER_URL",
     "http://presidio-analyzer:5001",
@@ -240,6 +248,22 @@ def filtered_request_headers(request: Request) -> dict[str, str]:
     return headers
 
 
+def authenticated_request_headers(request: Request) -> dict[str, str] | None:
+    """Validate the proxy token and return sanitized upstream headers."""
+    if not PII_PROXY_AUTH_TOKEN or not OPENCONNECTOR_RUNTIME_TOKEN:
+        logger.error("Required proxy authentication tokens are not configured")
+        return None
+
+    if request.headers.get("authorization", "") != (
+        f"Bearer {PII_PROXY_AUTH_TOKEN}"
+    ):
+        return None
+
+    headers = filtered_request_headers(request)
+    headers["authorization"] = f"Bearer {OPENCONNECTOR_RUNTIME_TOKEN}"
+    return headers
+
+
 @app.api_route(
     "/mcp",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
@@ -262,6 +286,10 @@ async def proxy_mcp_stream(request: Request):
     if len(body) > MAX_REQUEST_BYTES:
         return safe_error(413, "request_too_large")
 
+    headers = authenticated_request_headers(request)
+    if headers is None:
+        return safe_error(401, "unauthorized")
+
     url = f"{OC_URL}/mcp"
 
     try:
@@ -269,7 +297,7 @@ async def proxy_mcp_stream(request: Request):
             method=request.method,
             url=url,
             params=list(request.query_params.multi_items()),
-            headers=filtered_request_headers(request),
+            headers=headers,
             content=body,
         )
     except httpx.HTTPError:
