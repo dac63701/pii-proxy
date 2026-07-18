@@ -262,8 +262,22 @@ async def redact_json(app: FastAPI, value: Any) -> Any:
     raise RedactionFailure("Unsupported JSON value type")
 
 
-async def redact_mcp_body(app: FastAPI, body: bytes, content_type: str) -> bytes:
-    """Redact MCP JSON or SSE data without changing the MCP framing."""
+async def redact_mcp_body(
+    app: FastAPI,
+    body: bytes,
+    content_type: str,
+    status_code: int | None = None,
+) -> bytes:
+    """Redact MCP JSON or SSE data without changing the MCP framing.
+
+    OpenConnector may acknowledge an asynchronous MCP request with an empty
+    ``202 Accepted`` response. There is no provider payload to redact in that
+    case, but an empty response with any other status remains invalid and is
+    blocked by the fail-closed behavior below.
+    """
+    if status_code == 202 and not body:
+        return b""
+
     media_type = content_type.split(";", 1)[0].strip().lower()
 
     if media_type in {"application/json", "application/problem+json"}:
@@ -378,7 +392,12 @@ async def proxy_mcp_stream(request: Request):
     if len(upstream.content) > MAX_RESPONSE_BYTES:
         return safe_error(502, "upstream_response_too_large")
     try:
-        redacted_body = await redact_mcp_body(request.app, upstream.content, content_type)
+        redacted_body = await redact_mcp_body(
+            request.app,
+            upstream.content,
+            content_type,
+            status_code=upstream.status_code,
+        )
     except RedactionFailure:
         logger.exception("MCP response blocked because redaction failed")
         return safe_error(502, "redaction_failed")
