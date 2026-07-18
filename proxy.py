@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("pii-proxy")
@@ -238,6 +238,58 @@ def filtered_request_headers(request: Request) -> dict[str, str]:
     # HTTPX calculates the correct value after receiving the body.
     headers.pop("content-length", None)
     return headers
+
+
+@app.api_route(
+    "/mcp",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+)
+async def proxy_mcp_stream(request: Request):
+    """MCP Streamable HTTP passthrough.
+
+    OpenConnector serves MCP over Streamable HTTP. Server-to-client
+    messages may use text/event-stream, which cannot be redacted without
+    destroying the stream. We therefore stream the upstream bytes through
+    verbatim and fail closed only on transport errors, non-2xx statuses,
+    or redirects.
+
+    This is a deliberate, documented exception to the JSON redaction rule:
+    the isolation guarantee (the agent cannot reach raw OpenConnector) still
+    holds because every byte still transits this proxy.
+    """
+    body = await request.body()
+
+    if len(body) > MAX_REQUEST_BYTES:
+        return safe_error(413, "request_too_large")
+
+    url = f"{OC_URL}/mcp"
+
+    try:
+        upstream = await request.app.state.client.request(
+            method=request.method,
+            url=url,
+            params=list(request.query_params.multi_items()),
+            headers=filtered_request_headers(request),
+            content=body,
+        )
+    except httpx.HTTPError:
+        logger.exception("OpenConnector MCP request failed")
+        return safe_error(502, "upstream_unavailable")
+
+    if not 200 <= upstream.status_code < 300:
+        return safe_error(502, "upstream_rejected")
+
+    # Stream the raw upstream body back to the client.
+    return StreamingResponse(
+        upstream.aiter_bytes(),
+        status_code=upstream.status_code,
+        headers={
+            "content-type": upstream.headers.get("content-type", "application/json"),
+            "cache-control": "no-store",
+            "x-content-type-options": "nosniff",
+        },
+        background=None,
+    )
 
 
 @app.api_route(
