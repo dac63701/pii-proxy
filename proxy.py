@@ -371,6 +371,13 @@ async def proxy_mcp_stream(request: Request):
     if headers is None:
         return safe_error(401, "unauthorized")
 
+    # OpenConnector's MCP SDK (v1.29+) requires both "application/json" AND
+    # "text/event-stream" in the Accept header for POST requests or it returns
+    # 406 Not Acceptable.  Always set the canonical value so the proxy never
+    # accidentally passes a header that doesn't pass the check (e.g. when the
+    # incoming request has only "application/json" or a client sends */*).
+    headers["accept"] = "application/json, text/event-stream"
+
     url = f"{OC_URL}/mcp"
 
     try:
